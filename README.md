@@ -15,6 +15,7 @@ GhostMind is an AI research agent that reads arXiv papers, retrieves relevant do
 | **GraphRAG** | Citation graph (NetworkX) enables relationship-aware retrieval beyond keyword matching. |
 | **Self-evaluation** | Every answer is scored for confidence and hallucination rate before being returned. |
 | **Failure log** | Explicit, human-readable record of what went wrong and what strategy was tried next. |
+| **Multi-provider LLM** | Round-robin across all configured Gemini keys + OpenAI/Anthropic fallbacks with automatic quota handling. |
 
 ---
 
@@ -39,7 +40,7 @@ Agentic Retriever ──► Grade relevance ──► Rewrite query if needed (l
 GraphRAG Expansion (if strategy = graph|hybrid)
     │
     ▼
-Answer Generation (Gemini)
+Answer Generation (Gemini 2.0 Flash / OpenAI / Anthropic)
     │
     ▼
 Self-Evaluator ──► Confidence score + Hallucination rate
@@ -121,16 +122,43 @@ Open **http://localhost:5173** in your browser.
 
 ## Environment Variables
 
+### LLM Providers
+
+GhostMind uses a **multi-provider round-robin** strategy. It distributes calls across all configured providers, skips any that hit quota limits, and falls back gracefully.
+
+Each Gemini key is registered with **both** `gemini-2.0-flash` and `gemini-1.5-flash`, effectively doubling your free-tier capacity per key (1 key = 3,000 free requests/day).
+
+```
+# Add as many Gemini keys as you have Google accounts
+GEMINI_API_KEY=AIzaSy...your_first_key_here
+GEMINI_API_KEY_2=AIzaSy...second_key      # optional
+GEMINI_API_KEY_3=AIzaSy...third_key       # optional
+# ... up to GEMINI_API_KEY_10
+
+# Paid fallbacks (only used when all Gemini keys are exhausted)
+OPENAI_API_KEY=sk-...
+ANTHROPIC_API_KEY=sk-ant-...
+```
+
+### Full Variable Reference
+
 | Variable | Default | Description |
 |---|---|---|
 | `GEMINI_API_KEY` | *(required)* | Free at aistudio.google.com |
-| `LLM_BACKEND` | `gemini` | `gemini` / `openai` |
-| `LLM_MODEL` | `gemini-1.5-flash` | Model name |
+| `GEMINI_API_KEY_1` … `GEMINI_API_KEY_10` | *(optional)* | Extra Gemini keys for more free-tier capacity |
+| `OPENAI_API_KEY` | *(optional)* | Paid fallback provider |
+| `OPENAI_MODEL` | `gpt-4o-mini` | OpenAI model to use |
+| `ANTHROPIC_API_KEY` | *(optional)* | Paid fallback provider |
+| `ANTHROPIC_MODEL` | `claude-haiku-4-5-20251001` | Anthropic model to use |
+| `LLM_BACKEND` | `gemini` | Legacy single-backend override |
+| `LLM_MODEL` | `gemini-2.0-flash` | Legacy model override |
 | `DATABASE_URL` | `sqlite+aiosqlite:///./ghostmind.db` | SQLite by default, PostgreSQL supported |
 | `ARXIV_MAX_RESULTS` | `15` | Papers fetched per query |
+| `ARXIV_CATEGORIES` | `["cs.AI","cs.LG","cs.CL","cs.IR"]` | arXiv category filters |
 | `MEMRL_EPSILON` | `0.15` | Exploration rate (0=exploit, 1=explore) |
 | `MEMRL_ALPHA` | `0.1` | Learning rate for Q-value updates |
 | `MEMRL_GAMMA` | `0.9` | Discount factor |
+| `MEMORY_MAX_TRIPLETS` | `10000` | Max episodic triplets to store |
 
 ---
 
@@ -155,13 +183,14 @@ Interactive docs: **http://localhost:8000/docs**
 
 | Layer | Tech |
 |---|---|
-| LLM | Google Gemini 1.5 Flash (free tier) |
+| LLM (primary) | Google Gemini 2.0 Flash + Gemini 1.5 Flash (free tier, round-robin) |
+| LLM (fallback) | OpenAI gpt-4o-mini / Anthropic claude-haiku-4-5-20251001 (paid, optional) |
 | Embeddings | `all-MiniLM-L6-v2` via sentence-transformers (local, no API) |
 | Backend | FastAPI + SQLAlchemy async |
 | Database | SQLite (default) / PostgreSQL |
 | Knowledge graph | NetworkX |
 | Paper ingestion | arXiv Python SDK |
-| Frontend | React + Vite + Recharts |
+| Frontend | React 18 + Vite + Recharts + lucide-react |
 | MemRL | Custom TD learning on CPU |
 
 ---
@@ -203,7 +232,8 @@ ghostmind/
 │       ├── pages/          # Query, Dashboard, Memory, Sessions
 │       └── utils/api.js
 ├── start.sh                # Mac/Linux one-command run
-├── start.bat               # Windows one-command run
+├── start.ps1               # Windows PowerShell one-command run
+├── start.bat               # Windows CMD one-command run
 └── docker-compose.yml
 ```
 
