@@ -10,6 +10,7 @@ GhostMind fetches real arXiv papers, retrieves relevant documents using one of f
 
 | Feature | Description |
 |---|---|
+<<<<<<< HEAD
 | **MemRL episodic memory** | Stores `intent → strategy → outcome` triplets. Q-values update after every session using TD(0) learning. The agent learns which retrieval strategy works best per topic. |
 | **4 distinct retrieval strategies** | `semantic` (cosine similarity), `hybrid` (embedding + keyword re-rank), `graph` (citation graph expansion), `aggressive_rewrite` (domain keyword expansion + LLM rewrite). Each retrieves genuinely different documents. |
 | **Cold-start rotation** | First 4 sessions always try each strategy once so the memory table gets populated before exploitation begins. |
@@ -20,6 +21,14 @@ GhostMind fetches real arXiv papers, retrieves relevant documents using one of f
 | **GraphRAG** | Citation graph (NetworkX) enables relationship-aware retrieval for `graph` and `hybrid` strategies. |
 | **Self-evaluation** | Every answer is scored for confidence and hallucination rate by the LLM evaluator (for display). |
 | **Failure log** | Explicit record of sessions where quality < 0.4 and what strategy was tried next. |
+=======
+| **MemRL episodic memory** | Stores intent → strategy → outcome triplets. Q-values update after each session using TD learning. |
+| **Agentic RAG + self-correction** | Retriever grades its own results and rewrites queries if relevance is too low. |
+| **GraphRAG** | Citation graph (NetworkX) enables relationship-aware retrieval beyond keyword matching. |
+| **Self-evaluation** | Every answer is scored for confidence and hallucination rate before being returned. |
+| **Failure log** | Explicit, human-readable record of what went wrong and what strategy was tried next. |
+| **Multi-provider LLM** | Round-robin across all configured Gemini keys + OpenAI/Anthropic fallbacks with automatic quota handling. |
+>>>>>>> 8fe59a9eddcddb55c068984c2c34712bc8a90b03
 
 ---
 
@@ -54,8 +63,13 @@ Answer Generation (Groq LLaMA 3, with optional memory hint in prompt)
 Self-Evaluator (LLM) ──► confidence score + hallucination rate (display only)
     │
     ▼
+<<<<<<< HEAD
 Code-Level Quality Signal ──► answer length + source coverage + retrieval score
     │  this is the actual Q-learning reward (varies per session/strategy)
+=======
+Answer Generation (Gemini 2.0 Flash / OpenAI / Anthropic)
+    │
+>>>>>>> 8fe59a9eddcddb55c068984c2c34712bc8a90b03
     ▼
 MemRL TD(0) Update
     │  Q_new = Q_old + α × (reward − Q_old)
@@ -132,6 +146,7 @@ Open **http://localhost:5173** in your browser.
 
 ## Environment Variables
 
+<<<<<<< HEAD
 See `.env.example` for the full annotated file. Key variables:
 
 | Variable | Default | Description |
@@ -157,6 +172,45 @@ MEMRL_ALPHA=0.15       # stable learning rate
 ```
 
 After ~20 sessions on the same topic, set `MEMRL_EPSILON=0.0` to show pure exploitation in your demo.
+=======
+### LLM Providers
+
+GhostMind uses a **multi-provider round-robin** strategy. It distributes calls across all configured providers, skips any that hit quota limits, and falls back gracefully.
+
+Each Gemini key is registered with **both** `gemini-2.0-flash` and `gemini-1.5-flash`, effectively doubling your free-tier capacity per key (1 key = 3,000 free requests/day).
+
+```
+# Add as many Gemini keys as you have Google accounts
+GEMINI_API_KEY=AIzaSy...your_first_key_here
+GEMINI_API_KEY_2=AIzaSy...second_key      # optional
+GEMINI_API_KEY_3=AIzaSy...third_key       # optional
+# ... up to GEMINI_API_KEY_10
+
+# Paid fallbacks (only used when all Gemini keys are exhausted)
+OPENAI_API_KEY=sk-...
+ANTHROPIC_API_KEY=sk-ant-...
+```
+
+### Full Variable Reference
+
+| Variable | Default | Description |
+|---|---|---|
+| `GEMINI_API_KEY` | *(required)* | Free at aistudio.google.com |
+| `GEMINI_API_KEY_1` … `GEMINI_API_KEY_10` | *(optional)* | Extra Gemini keys for more free-tier capacity |
+| `OPENAI_API_KEY` | *(optional)* | Paid fallback provider |
+| `OPENAI_MODEL` | `gpt-4o-mini` | OpenAI model to use |
+| `ANTHROPIC_API_KEY` | *(optional)* | Paid fallback provider |
+| `ANTHROPIC_MODEL` | `claude-haiku-4-5-20251001` | Anthropic model to use |
+| `LLM_BACKEND` | `gemini` | Legacy single-backend override |
+| `LLM_MODEL` | `gemini-2.0-flash` | Legacy model override |
+| `DATABASE_URL` | `sqlite+aiosqlite:///./ghostmind.db` | SQLite by default, PostgreSQL supported |
+| `ARXIV_MAX_RESULTS` | `15` | Papers fetched per query |
+| `ARXIV_CATEGORIES` | `["cs.AI","cs.LG","cs.CL","cs.IR"]` | arXiv category filters |
+| `MEMRL_EPSILON` | `0.15` | Exploration rate (0=exploit, 1=explore) |
+| `MEMRL_ALPHA` | `0.1` | Learning rate for Q-value updates |
+| `MEMRL_GAMMA` | `0.9` | Discount factor |
+| `MEMORY_MAX_TRIPLETS` | `10000` | Max episodic triplets to store |
+>>>>>>> 8fe59a9eddcddb55c068984c2c34712bc8a90b03
 
 ---
 
@@ -183,6 +237,7 @@ curl -X POST http://localhost:8000/api/v1/query \
   -d '{"query": "What is MemRL and how does it work?"}'
 ```
 
+<<<<<<< HEAD
 The response includes a `memrl_debug` block showing exactly what memory knew before and after the session:
 
 ```json
@@ -207,6 +262,19 @@ The response includes a `memrl_debug` block showing exactly what memory knew bef
   }
 }
 ```
+=======
+| Layer | Tech |
+|---|---|
+| LLM (primary) | Google Gemini 2.0 Flash + Gemini 1.5 Flash (free tier, round-robin) |
+| LLM (fallback) | OpenAI gpt-4o-mini / Anthropic claude-haiku-4-5-20251001 (paid, optional) |
+| Embeddings | `all-MiniLM-L6-v2` via sentence-transformers (local, no API) |
+| Backend | FastAPI + SQLAlchemy async |
+| Database | SQLite (default) / PostgreSQL |
+| Knowledge graph | NetworkX |
+| Paper ingestion | arXiv Python SDK |
+| Frontend | React 18 + Vite + Recharts + lucide-react |
+| MemRL | Custom TD learning on CPU |
+>>>>>>> 8fe59a9eddcddb55c068984c2c34712bc8a90b03
 
 ---
 
@@ -293,7 +361,13 @@ ghostmind/
 │   └── src/
 │       ├── pages/               # Research, Benchmarks, Memory, Sessions
 │       └── utils/api.js
+<<<<<<< HEAD
 ├── start.sh / start.ps1 / start.bat
+=======
+├── start.sh                # Mac/Linux one-command run
+├── start.ps1               # Windows PowerShell one-command run
+├── start.bat               # Windows CMD one-command run
+>>>>>>> 8fe59a9eddcddb55c068984c2c34712bc8a90b03
 └── docker-compose.yml
 ```
 
