@@ -1,0 +1,24 @@
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+python-dotenv==1.0.1
+pydantic==2.7.1
+pydantic-settings==2.2.1
+sqlalchemy==2.0.30
+aiosqlite==0.20.0
+# CHANGED: replaced sentence-transformers (pulls PyTorch ~350MB) with fastembed
+# fastembed uses ONNX Runtime — same model, ~50MB RSS, no torch dependency
+fastembed==0.3.6
+networkx==3.3
+numpy==1.26.4
+scipy==1.13.0
+httpx==0.27.0
+arxiv==2.1.0
+# ADDED: retry logic for arXiv 429 errors
+tenacity==8.3.0
+google-generativeai==0.7.2
+structlog==24.2.0
+aiofiles==23.2.1
+python-multipart==0.0.9
+anthropic>=0.30.0
+openai>=1.30.0
+groq>=0.9.0
