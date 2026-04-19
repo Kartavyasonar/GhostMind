@@ -36,7 +36,6 @@ def get_embedder():
         model_name = settings.EMBED_MODEL
         # Resolve short names to fully-qualified HuggingFace IDs that fastembed supports
         _SHORT_NAME_MAP = {
-            "paraphrase-MiniLM-L3-v2": "sentence-transformers/paraphrase-MiniLM-L3-v2",
             "all-MiniLM-L6-v2": "sentence-transformers/all-MiniLM-L6-v2",
             "all-MiniLM-L3-v2": "sentence-transformers/all-MiniLM-L3-v2",
         }

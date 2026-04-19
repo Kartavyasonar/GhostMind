@@ -45,7 +45,7 @@ class Settings(BaseSettings):
     # the 512MB Render free tier without OOM.
     # Set EMBED_MODEL=sentence-transformers/all-MiniLM-L6-v2 in .env for
     # better accuracy if you upgrade to a paid Render instance.
-    EMBED_MODEL: str = "paraphrase-MiniLM-L3-v2"
+    EMBED_MODEL: str = "sentence-transformers/all-MiniLM-L6-v2"
     EMBED_DIM: int = 384
 
     # ── arXiv ingestion ───────────────────────────────────────────────────

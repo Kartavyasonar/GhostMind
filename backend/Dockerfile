@@ -17,7 +17,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Pre-download the embedding model into the image so the first request
 # doesn't trigger a cold download on the free-tier instance.
 # fastembed downloads to ~/.cache/fastembed by default.
-RUN python -c "from fastembed import TextEmbedding; TextEmbedding('sentence-transformers/paraphrase-MiniLM-L3-v2')"
+RUN python -c "from fastembed import TextEmbedding; TextEmbedding('sentence-transformers/all-MiniLM-L6-v2')"
 
 COPY . .
 
