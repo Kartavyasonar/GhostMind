@@ -158,4 +158,102 @@ async def _hyde_expand(query: str) -> str:
             user=query, max_tokens=80, temperature=0.4)
         return f"{query} {resp.strip()}"
     except Exception:
-       
+        return query
+
+
+async def _crag_loop(query: str, db: AsyncSession, top_k: int,
+                     strategy: str) -> Tuple[List[Tuple[Paper, float]], int, float]:
+    """Corrective RAG: retrieve → grade (raw cosine) → rewrite if weak."""
+    current, rewrites = query, 0
+    best_ranked, best_score = [], 0.0
+    for attempt in range(MAX_REWRITES + 1):
+        q_emb = embed_one(current)
+        ranked = await _semantic_search(q_emb, db, top_k=top_k * 2)
+        score = _raw_relevance(ranked)
+        if score > best_score:
+            best_score, best_ranked = score, ranked
+        if score >= settings.CRAG_REWRITE_THRESHOLD or attempt == MAX_REWRITES or not ranked:
+            break
+        current = await _rewrite_query(current, [p for p, _ in ranked[:4]])
+        rewrites += 1
+        log.info("CRAG rewrite", strategy=strategy, attempt=attempt,
+                 new_query=current[:60])
+    return best_ranked, rewrites, best_score
+
+
+# ── Strategies ─────────────────────────────────────────────────────────────
+
+async def _retrieve_semantic(query, db, top_k):
+    ranked, rewrites, score = await _crag_loop(query, db, top_k, "semantic")
+    docs = _mmr_select(ranked, top_k)
+    return docs, rewrites, score, {p.id: s for p, s in ranked[:top_k]}
+
+
+async def _retrieve_hybrid(query, db, top_k):
+    q_emb = embed_one(query)
+    ranked = await _semantic_search(q_emb, db, top_k=top_k * 3)
+    if not ranked:
+        return [], 0, 0.0, {}
+    papers = [p for p, _ in ranked]
+    emb_order = [p.id for p, _ in ranked]
+    bm25_scores = _bm25_rank(query, papers)
+    bm25_order = [p.id for p, _ in sorted(zip(papers, bm25_scores),
+                                          key=lambda x: x[1], reverse=True)]
+    fused_ids = _rrf_fuse([emb_order, bm25_order], k=settings.RRF_K)
+    by_id = {p.id: (p, s) for p, s in ranked}
+    fused = [by_id[pid] for pid in fused_ids if pid in by_id]
+    docs = _mmr_select(fused, top_k)
+    return docs, 0, _raw_relevance(fused), {p.id: s for p, s in fused[:top_k]}
+
+
+async def _retrieve_graph(query, db, top_k):
+    from app.graph.knowledge_graph import build_graph, graph_expand
+    q_emb = embed_one(query)
+    ranked = await _semantic_search(q_emb, db, top_k=top_k)
+    score = _raw_relevance(ranked)
+    seeds = [p for p, _ in ranked[:5]]
+    seed_ids = [d.arxiv_id.split(":")[0] for d in seeds]
+    await build_graph(db)
+    expanded_ids = graph_expand(seed_ids, hops=2, max_nodes=15)
+    docs = list(seeds)
+    seen = {d.id for d in docs}
+    for arxiv_id in expanded_ids:
+        r = await db.execute(
+            select(Paper).where(Paper.arxiv_id.like(f"{arxiv_id}%")).limit(2))
+        for p in r.scalars().all():
+            if p.id not in seen and p.embedding is not None:
+                docs.append(p)
+                seen.add(p.id)
+    return docs[:top_k], 0, score, {p.id: s for p, s in ranked[:top_k]}
+
+
+async def _retrieve_aggressive(query, db, top_k):
+    hyde_q = await _hyde_expand(query)
+    q_emb = embed_one(hyde_q)
+    ranked = await _semantic_search(q_emb, db, top_k=top_k * 2)
+    score = _raw_relevance(ranked)
+    rewrites = 1
+    if score < settings.CRAG_REWRITE_THRESHOLD and ranked:
+        rewritten = await _rewrite_query(query, [p for p, _ in ranked[:4]])
+        q2 = embed_one(rewritten)
+        ranked2 = await _semantic_search(q2, db, top_k=top_k * 2)
+        s2 = _raw_relevance(ranked2)
+        if s2 > score:
+            ranked, score = ranked2, s2
+        rewrites = 2
+    docs = _mmr_select(ranked, top_k)
+    return docs, rewrites, score, {p.id: s for p, s in ranked[:top_k]}
+
+
+# ── Dispatch ───────────────────────────────────────────────────────────────
+
+async def retrieve(query: str, db: AsyncSession, strategy: str = "semantic",
+                   top_k: int = TOP_K):
+    """Returns (docs, rewrite_count, honest_relevance_score, per_doc_scores)."""
+    if strategy == "hybrid":
+        return await _retrieve_hybrid(query, db, top_k)
+    if strategy == "graph":
+        return await _retrieve_graph(query, db, top_k)
+    if strategy == "aggressive_rewrite":
+        return await _retrieve_aggressive(query, db, top_k)
+    return await _retrieve_semantic(query, db, top_k)
