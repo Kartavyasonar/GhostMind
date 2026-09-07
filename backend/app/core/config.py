@@ -27,7 +27,7 @@ class Settings(BaseSettings):
     ANTHROPIC_MODEL: str = "claude-haiku-4-5-20251001"
 
     LLM_BACKEND: str = "gemini"
-    LLM_MODEL: str = "gemini-2.0-flash"
+    LLM_MODEL: str = "gemini-3.6-flash"
     LLM_TEMPERATURE: float = 0.2
     LLM_MAX_TOKENS: int = 1024
 
