@@ -154,6 +154,7 @@ async def run_agent(query: str, db: AsyncSession,
     else:
         judge = faith["faithfulness"]                        # clear-cut → skip 1-2 LLM calls
     confidence, hallucination = calibrate(faith["faithfulness"], cite["citation_precision"],relevance_score, judge)
+    code_quality = compute_outcome_quality(faith["faithfulness"], cite["citation_precision"], relevance_score, answer)
 
     # 7. Persist
     eval_breakdown = {
