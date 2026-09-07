@@ -49,15 +49,18 @@ Respond with ONLY the intent phrase, nothing else."""
 
 _CITE_SENT_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9\[])")
 _MARK_RE = re.compile(r"\[(\d{1,2}(?:,\s*\d{1,2})*)\]")
+_INTENT_CACHE: dict = {}
 
 async def _classify_intent_fast(query: str) -> str:
+    cache_key = query.strip().lower()
+    if cache_key in _INTENT_CACHE:
+        return _INTENT_CACHE[cache_key]
     try:
         llm = get_llm()
-        resp = await llm.complete(system=INTENT_CLASSIFY_PROMPT, user=query,
-                                  max_tokens=20, temperature=0.0)
+        resp = await llm.complete(system=INTENT_CLASSIFY_PROMPT, user=query,  max_tokens=20, temperature=0.0)
         intent = resp.strip().strip('"').strip("'")
-        if 2 <= len(intent.split()) <= 8 and "\n" not in intent:
-            return intent
+        if not (2 <= len(intent.split()) <= 8 and "\n" not in intent):
+           return intent
     except Exception:
         pass
     return query[:60]
