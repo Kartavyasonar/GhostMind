@@ -1,23 +1,23 @@
-"""Agentic RAG retriever — strategies now produce meaningfully different results.
+"""Agentic RAG retriever v2 — honest scores, modern fusion, real strategy diversity.
 
-FIXES vs original:
-  The original retrieve() ignored the `strategy` parameter entirely — it ran
-  the same semantic search regardless of whether strategy was "semantic",
-  "graph", "hybrid", or "aggressive_rewrite". This is why all 4 strategies
-  produced identical answers: they all retrieved the exact same documents.
-
-  Now each strategy does something genuinely different:
-
-  semantic:           Standard top-K cosine similarity (baseline)
-  hybrid:             Combines embedding score + keyword BM25-style score
-  graph:              Uses paper citation/co-author graph expansion
-  aggressive_rewrite: Forces 2 query rewrites before retrieval, adds keyword expansion
-
-  This creates real variation in retrieved docs → different answers → different
-  code_quality scores → meaningful Q-learning signal.
+FIXES vs v1:
+  1. REMOVED score inflation (*1.4 / *1.3 / *1.2). Raw cosine is reported as-is,
+     so thresholds mean something and the CRAG rewrite loop actually fires.
+  2. HYBRID now uses Reciprocal Rank Fusion (RRF, k=60) — the industry-standard
+     way to fuse cosine + BM25 rankings. v1 mixed incompatible score scales
+     (0.6*cos + 0.4*kw) which is mathematically meaningless.
+  3. MMR diversification (λ=0.7) removes near-duplicate papers from top-K.
+  4. CRAG (Corrective RAG): if raw top-3 cosine < CRAG_REWRITE_THRESHOLD the
+     query is rewritten and re-retrieved — rewrites now happen when needed,
+     so the "Rewrites" column becomes a real signal again.
+  5. aggressive_rewrite uses HyDE (hypothetical document embedding) instead of
+     a naive keyword suffix.
+  6. Returns per-document scores so the agent can verify citations.
 """
-from typing import List, Tuple
+import math
 import re
+from typing import List, Tuple, Dict
+import numpy as np
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -29,264 +29,195 @@ from app.core.models import Paper
 
 log = structlog.get_logger()
 
-RELEVANCE_THRESHOLD = 0.45
-MAX_REWRITES = 2
 TOP_K = 8
-EMBED_SCORE_TRUST_THRESHOLD = 0.35
+MAX_REWRITES = 2
 
+def _cos(a, b) -> float:
+    a = np.asarray(a, dtype=np.float32); b = np.asarray(b, dtype=np.float32)
+    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-9))
 
-# ── Core search functions ─────────────────────────────────────────────────────
+# ── Core search ────────────────────────────────────────────────────────────
 
-async def _semantic_search(
-    query_embedding: List[float],
-    db: AsyncSession,
-    top_k: int = TOP_K,
-) -> List[Tuple[Paper, float]]:
+async def _semantic_search(q_emb: List[float], db: AsyncSession,
+                           top_k: int) -> List[Tuple[Paper, float]]:
     result = await db.execute(select(Paper).where(Paper.embedding.isnot(None)))
     papers = result.scalars().all()
     if not papers:
         return []
-    corpus = [p.embedding for p in papers]
-    scores = batch_cosine_similarity(query_embedding, corpus)
+    scores = batch_cosine_similarity(q_emb, [p.embedding for p in papers])
     ranked = sorted(zip(papers, scores), key=lambda x: x[1], reverse=True)
     return ranked[:top_k]
 
-
-def _keyword_score(query: str, paper: Paper) -> float:
-    """Simple BM25-inspired keyword matching for hybrid boost."""
-    query_words = set(re.findall(r'\b\w{4,}\b', query.lower()))
-    if not query_words:
-        return 0.0
-    text = f"{paper.title} {paper.abstract}".lower()
-    matches = sum(1 for w in query_words if w in text)
-    return matches / len(query_words)
-
-
-def _embed_based_relevance(ranked: List[Tuple[Paper, float]]) -> float:
+def _raw_relevance(ranked: List[Tuple[Paper, float]]) -> float:
+    """HONEST relevance: mean raw cosine of top-3. No inflation multipliers."""
     if not ranked:
         return 0.0
-    top_scores = [s for _, s in ranked[:4]]
-    return sum(top_scores) / len(top_scores)
+    top = [s for _, s in ranked[:3]]
+    return round(sum(top) / len(top), 4)
 
+# ── BM25-lite (for RRF) ────────────────────────────────────────────────────
 
-async def _grade_relevance_llm(query: str, docs: List[Paper]) -> float:
-    if not docs:
-        return 0.0
-    snippets = "\n".join(
-        f"[{i+1}] {d.title}: {d.abstract[:200]}" for i, d in enumerate(docs[:4])
-    )
-    prompt = (
-        f"Query: {query}\n\nRetrieved documents:\n{snippets}\n\n"
-        "Rate relevance 0-1. Respond with ONLY a single decimal number like 0.82"
-    )
+def _bm25_rank(query: str, papers: List[Paper], k1: float = 1.5, b: float = 0.75) -> List[float]:
+    docs = [f"{p.title} {p.abstract}".lower().split() for p in papers]
+    N = len(docs) or 1
+    avgdl = sum(len(d) for d in docs) / N
+    df: Dict[str, int] = {}
+    for d in docs:
+        for t in set(d):
+            df[t] = df.get(t, 0) + 1
+    q_terms = re.findall(r"\w{3,}", query.lower())
+    scores = []
+    for d in docs:
+        dl = len(d) or 1
+        tf: Dict[str, int] = {}
+        for t in d:
+            tf[t] = tf.get(t, 0) + 1
+        s = 0.0
+        for t in q_terms:
+            if t not in tf:
+                continue
+            idf = math.log(1 + (N - df[t] + 0.5) / (df[t] + 0.5))
+            s += idf * (tf[t] * (k1 + 1)) / (tf[t] + k1 * (1 - b + b * dl / avgdl))
+        scores.append(s)
+    return scores
+
+def _rrf_fuse(rank_lists: List[List[str]], k: int = 60) -> List[str]:
+    """Reciprocal Rank Fusion — scale-free ranking combination."""
+    scores: Dict[str, float] = {}
+    for ranking in rank_lists:
+        for rank, pid in enumerate(ranking):
+            scores[pid] = scores.get(pid, 0.0) + 1.0 / (k + rank + 1)
+    return sorted(scores, key=scores.get, reverse=True)
+
+def _mmr_select(candidates: List[Tuple[Paper, float]], top_k: int,
+                lambda_: float = None) -> List[Paper]:
+    """Maximal Marginal Relevance — relevance minus redundancy."""
+    lambda_ = lambda_ if lambda_ is not None else settings.MMR_LAMBDA
+    selected: List[Paper] = []
+    remaining = list(candidates)
+    while remaining and len(selected) < top_k:
+        best, best_val = None, -math.inf
+        for p, s in remaining:
+            redundancy = max((_cos(p.embedding, sel.embedding) for sel in selected),
+                             default=0.0)
+            val = lambda_ * s - (1 - lambda_) * redundancy
+            if val > best_val:
+                best, best_val = p, val
+        selected.append(best)
+        remaining.remove((best, best_val and best_val or best_val))
+        remaining = [x for x in remaining if x[0] is not best]
+    return selected
+
+# ── CRAG helpers ───────────────────────────────────────────────────────────
+
+async def _rewrite_query(query: str, docs: List[Paper]) -> str:
+    snippets = "\n".join(f"[{i+1}] {d.title}: {d.abstract[:150]}" for i, d in enumerate(docs[:4]))
+    prompt = (f"Query: {query}\n\nDocuments retrieved:\n{snippets}\n\n"
+              "Rewrite the query with better technical keywords for academic search.\n"
+              "Respond ONLY with the rewritten query.")
+    try:
+        llm = get_llm()
+        resp = await llm.complete(system="You are a retrieval optimizer.",
+                                  user=prompt, max_tokens=60, temperature=0.3)
+        return resp.strip() or query
+    except Exception:
+        return query
+
+async def _hyde_expand(query: str) -> str:
+    """HyDE: embed query + a hypothetical abstract written by the LLM."""
     try:
         llm = get_llm()
         resp = await llm.complete(
-            system="You are a relevance grader. Respond ONLY with a single decimal number between 0 and 1.",
-            user=prompt,
-            max_tokens=8,
-            temperature=0.0,
-        )
-        score = float(resp.strip().split()[0])
-        return max(0.0, min(1.0, score))
-    except Exception as e:
-        log.warning("Relevance grading failed", error=str(e))
-        return 0.5
+            system="Write 2 sentences of a hypothetical academic abstract that would "
+                   "perfectly answer this query. Only the sentences.",
+            user=query, max_tokens=80, temperature=0.4)
+        return f"{query} {resp.strip()}"
+    except Exception:
+        return query
 
-
-async def _rewrite_query(query: str, docs: List[Paper]) -> Tuple[float, str]:
-    snippets = "\n".join(
-        f"[{i+1}] {d.title}: {d.abstract[:150]}" for i, d in enumerate(docs[:4])
-    )
-    prompt = (
-        f"Query: {query}\n\nDocuments retrieved:\n{snippets}\n\n"
-        "1. Rate relevance 0-1 (single decimal)\n"
-        "2. Rewrite the query with better technical keywords for academic paper search\n\n"
-        "Respond ONLY in this exact format:\n"
-        "RELEVANCE: <number>\n"
-        "REWRITE: <improved query>"
-    )
-    try:
-        llm = get_llm()
-        resp = await llm.complete(
-            system="You are a retrieval optimizer. Respond ONLY in the specified format.",
-            user=prompt,
-            max_tokens=80,
-            temperature=0.3,
-        )
-        relevance = 0.5
-        rewrite = query
-        for line in resp.splitlines():
-            line = line.strip()
-            if line.upper().startswith("RELEVANCE:"):
-                import re as _re
-                m = _re.search(r"[\d.]+", line)
-                if m:
-                    relevance = max(0.0, min(1.0, float(m.group())))
-            elif line.upper().startswith("REWRITE:"):
-                rewrite = line.split(":", 1)[1].strip() or query
-        return relevance, rewrite
-    except Exception as e:
-        log.warning("Query rewrite failed", error=str(e))
-        return 0.5, query
-
-
-# ── Strategy-specific retrieval functions ─────────────────────────────────────
-
-async def _retrieve_semantic(query: str, db: AsyncSession, top_k: int) -> Tuple[List[Paper], int, float]:
-    """Standard embedding cosine similarity retrieval."""
-    current_query = query
-    rewrite_count = 0
-    best_docs: List[Paper] = []
-    best_score = 0.0
-
+async def _crag_loop(query: str, db: AsyncSession, top_k: int,
+                     strategy: str) -> Tuple[List[Tuple[Paper, float]], int, float]:
+    """Corrective RAG: retrieve → grade (raw cosine) → rewrite if weak."""
+    current, rewrites = query, 0
+    best_ranked, best_score = [], 0.0
     for attempt in range(MAX_REWRITES + 1):
-        q_emb = embed_one(current_query)
-        ranked = await _semantic_search(q_emb, db, top_k=top_k)
-        docs = [p for p, _ in ranked]
-
-        embed_score = _embed_based_relevance(ranked)
-        if embed_score >= EMBED_SCORE_TRUST_THRESHOLD:
-            relevance = min(1.0, embed_score * 1.4)
-            log.info("Retrieval attempt (embed-only)", attempt=attempt,
-                     relevance=round(relevance, 3), strategy="semantic")
-        else:
-            relevance = await _grade_relevance_llm(current_query, docs)
-            log.info("Retrieval attempt (LLM graded)", attempt=attempt,
-                     relevance=round(relevance, 3), strategy="semantic")
-
-        if relevance > best_score:
-            best_score = relevance
-            best_docs = docs
-
-        if relevance >= RELEVANCE_THRESHOLD or attempt == MAX_REWRITES:
+        q_emb = embed_one(current)
+        ranked = await _semantic_search(q_emb, db, top_k=top_k * 2)
+        score = _raw_relevance(ranked)
+        if score > best_score:
+            best_score, best_ranked = score, ranked
+        if score >= settings.CRAG_REWRITE_THRESHOLD or attempt == MAX_REWRITES or not ranked:
             break
+        current = await _rewrite_query(current, [p for p, _ in ranked[:4]])
+        rewrites += 1
+        log.info("CRAG rewrite", strategy=strategy, attempt=attempt, new_query=current[:60])
+    return best_ranked, rewrites, best_score
 
-        _, current_query = await _rewrite_query(current_query, docs)
-        rewrite_count += 1
-        log.info("Query rewritten", attempt=attempt, new_query=current_query[:60])
+# ── Strategies ─────────────────────────────────────────────────────────────
 
-    return best_docs, rewrite_count, best_score
+async def _retrieve_semantic(query, db, top_k):
+    ranked, rewrites, score = await _crag_loop(query, db, top_k, "semantic")
+    docs = _mmr_select(ranked, top_k)
+    return docs, rewrites, score, {p.id: s for p, s in ranked[:top_k]}
 
-
-async def _retrieve_hybrid(query: str, db: AsyncSession, top_k: int) -> Tuple[List[Paper], int, float]:
-    """
-    Hybrid: embedding similarity + keyword matching combined.
-    Retrieves more candidates then re-ranks using both signals.
-    This often finds different top-K than pure semantic search.
-    """
+async def _retrieve_hybrid(query, db, top_k):
     q_emb = embed_one(query)
-    # Fetch more candidates (top_k * 2) to re-rank
-    ranked = await _semantic_search(q_emb, db, top_k=top_k * 2)
-
+    ranked = await _semantic_search(q_emb, db, top_k=top_k * 3)
     if not ranked:
-        return [], 0, 0.0
+        return [], 0, 0.0, {}
+    papers = [p for p, _ in ranked]
+    emb_order = [p.id for p, _ in ranked]
+    bm25_scores = _bm25_rank(query, papers)
+    bm25_order = [p.id for p, _ in sorted(zip(papers, bm25_scores),
+                                          key=lambda x: x[1], reverse=True)]
+    fused_ids = _rrf_fuse([emb_order, bm25_order], k=settings.RRF_K)
+    by_id = {p.id: (p, s) for p, s in ranked}
+    fused = [by_id[pid] for pid in fused_ids if pid in by_id]
+    docs = _mmr_select(fused, top_k)
+    return docs, 0, _raw_relevance(fused), {p.id: s for p, s in fused[:top_k]}
 
-    # Re-rank combining embedding score (0.6) + keyword score (0.4)
-    combined = []
-    for paper, embed_score in ranked:
-        kw_score = _keyword_score(query, paper)
-        combined_score = 0.6 * embed_score + 0.4 * kw_score
-        combined.append((paper, combined_score))
-
-    combined.sort(key=lambda x: x[1], reverse=True)
-    best_docs = [p for p, _ in combined[:top_k]]
-    best_score = combined[0][1] if combined else 0.0
-
-    log.info("Retrieval attempt (hybrid)", relevance=round(best_score, 3),
-             strategy="hybrid", keyword_reranked=True)
-    return best_docs, 0, min(1.0, best_score * 1.3)
-
-
-async def _retrieve_graph(query: str, db: AsyncSession, top_k: int) -> Tuple[List[Paper], int, float]:
-    """
-    Graph: semantic search + citation neighbourhood expansion.
-    Finds papers that cite or are cited by the top results.
-    Returns a broader, more connected set of documents.
-    """
+async def _retrieve_graph(query, db, top_k):
     from app.graph.knowledge_graph import build_graph, graph_expand
-
     q_emb = embed_one(query)
     ranked = await _semantic_search(q_emb, db, top_k=top_k)
-    seed_docs = [p for p, _ in ranked[:5]]
-    embed_score = _embed_based_relevance(ranked)
-
-    # Expand via citation graph
-    seed_ids = [d.arxiv_id.split(":")[0] for d in seed_docs]
+    score = _raw_relevance(ranked)
+    seeds = [p for p, _ in ranked[:5]]
+    seed_ids = [d.arxiv_id.split(":")[0] for d in seeds]
     await build_graph(db)
     expanded_ids = graph_expand(seed_ids, hops=2, max_nodes=15)
-
-    expanded_docs = list(seed_docs)
-    existing_ids = {d.id for d in expanded_docs}
-
+    docs = list(seeds)
+    seen = {d.id for d in docs}
     for arxiv_id in expanded_ids:
-        result = await db.execute(
-            select(Paper).where(Paper.arxiv_id.like(f"{arxiv_id}%")).limit(2)
-        )
-        extra = result.scalars().all()
-        for p in extra:
-            if p.id not in existing_ids:
-                expanded_docs.append(p)
-                existing_ids.add(p.id)
+        r = await db.execute(select(Paper).where(Paper.arxiv_id.like(f"{arxiv_id}%")).limit(2))
+        for p in r.scalars().all():
+            if p.id not in seen:
+                docs.append(p); seen.add(p.id)
+    return docs[:top_k], 0, score, {p.id: s for p, s in ranked[:top_k]}
 
-    best_docs = expanded_docs[:top_k]
-    relevance = min(1.0, embed_score * 1.2)
+async def _retrieve_aggressive(query, db, top_k):
+    hyde_q = await _hyde_expand(query)
+    q_emb = embed_one(hyde_q)
+    ranked = await _semantic_search(q_emb, db, top_k=top_k * 2)
+    score = _raw_relevance(ranked)
+    rewrites = 1
+    if score < settings.CRAG_REWRITE_THRESHOLD and ranked:
+        rewritten = await _rewrite_query(query, [p for p, _ in ranked[:4]])
+        q2 = embed_one(rewritten)
+        ranked2 = await _semantic_search(q2, db, top_k=top_k * 2)
+        s2 = _raw_relevance(ranked2)
+        if s2 > score:
+            ranked, score = ranked2, s2
+        rewrites = 2
+    docs = _mmr_select(ranked, top_k)
+    return docs, rewrites, score, {p.id: s for p, s in ranked[:top_k]}
 
-    log.info("Retrieval attempt (graph)", relevance=round(relevance, 3),
-             strategy="graph", expanded_count=len(expanded_docs))
-    return best_docs, 0, relevance
-
-
-async def _retrieve_aggressive_rewrite(query: str, db: AsyncSession, top_k: int) -> Tuple[List[Paper], int, float]:
-    """
-    Aggressive rewrite: always rewrites the query twice before retrieval.
-    Adds domain-specific keyword expansion for academic paper search.
-    Good at finding relevant papers when the original query is colloquial.
-    """
-    # First expansion: make the query more academic/technical
-    expanded_query = f"{query} survey methods architecture performance benchmark"
-
-    q_emb = embed_one(expanded_query)
-    ranked = await _semantic_search(q_emb, db, top_k=top_k)
-    embed_score = _embed_based_relevance(ranked)
-
-    if embed_score < EMBED_SCORE_TRUST_THRESHOLD:
-        # Do one LLM-powered rewrite on top of the expansion
-        _, rewritten = await _rewrite_query(expanded_query, [p for p, _ in ranked])
-        q_emb2 = embed_one(rewritten)
-        ranked2 = await _semantic_search(q_emb2, db, top_k=top_k)
-        score2 = _embed_based_relevance(ranked2)
-        if score2 > embed_score:
-            ranked = ranked2
-            embed_score = score2
-
-    best_docs = [p for p, _ in ranked]
-    relevance = min(1.0, embed_score * 1.4)
-
-    log.info("Retrieval attempt (aggressive_rewrite)", relevance=round(relevance, 3),
-             strategy="aggressive_rewrite")
-    return best_docs, 1, relevance
-
-
-# ── Main dispatch ──────────────────────────────────────────────────────────────
-
-async def retrieve(
-    query: str,
-    db: AsyncSession,
-    strategy: str = "semantic",
-    top_k: int = TOP_K,
-) -> Tuple[List[Paper], int, float]:
-    """
-    Dispatch to the correct strategy-specific retrieval function.
-    Each strategy retrieves differently, creating real variation in docs
-    and thus real variation in answer quality and Q-learning reward.
-    """
+async def retrieve(query: str, db: AsyncSession, strategy: str = "semantic",
+                   top_k: int = TOP_K):
+    """Returns (docs, rewrite_count, honest_relevance_score, per_doc_scores)."""
     if strategy == "hybrid":
         return await _retrieve_hybrid(query, db, top_k)
-    elif strategy == "graph":
+    if strategy == "graph":
         return await _retrieve_graph(query, db, top_k)
-    elif strategy == "aggressive_rewrite":
-        return await _retrieve_aggressive_rewrite(query, db, top_k)
-    else:
-        # "semantic" and any unknown strategy → standard semantic search
-        return await _retrieve_semantic(query, db, top_k)
+    if strategy == "aggressive_rewrite":
+        return await _retrieve_aggressive(query, db, top_k)
+    return await _retrieve_semantic(query, db, top_k)
