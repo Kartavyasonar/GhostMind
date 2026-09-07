@@ -146,17 +146,14 @@ async def run_agent(query: str, db: AsyncSession,
               f"Provide a comprehensive, cited answer." + memory_hint),
         max_tokens=settings.LLM_MAX_TOKENS, temperature=settings.LLM_TEMPERATURE)
 
-    # 6. MEASURED evaluation (no more flat 0.8/0.2)
+    # 6. MEASURED evaluation — judge ONLY in the uncertain middle band
     faith = measure_faithfulness(answer, docs)
     cite = _verify_citations(answer, docs)
-    judge = await llm_judge_score(query, answer, docs)
-    confidence, hallucination = calibrate(faith["faithfulness"], cite["citation_precision"],
-                                          relevance_score, judge)
-    code_quality = compute_outcome_quality(faith["faithfulness"], cite["citation_precision"],
-                                           relevance_score, answer)
-    log.info("Measured quality", faithfulness=faith["faithfulness"],
-             citation_precision=cite["citation_precision"], judge=judge,
-             relevance=relevance_score, quality=code_quality)
+    if 0.25 <= faith["faithfulness"] <= 0.80:
+        judge = await llm_judge_score(query, answer, docs)   # uncertain → ask judge
+    else:
+        judge = faith["faithfulness"]                        # clear-cut → skip 1-2 LLM calls
+    confidence, hallucination = calibrate(faith["faithfulness"], cite["citation_precision"],relevance_score, judge)
 
     # 7. Persist
     eval_breakdown = {
