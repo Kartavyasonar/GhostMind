@@ -45,7 +45,7 @@ class Settings(BaseSettings):
     # ── NEW: Evaluation v2 (grounded, calibrated) ─────────────────────────
     FAITHFULNESS_THRESHOLD: float = 0.50     # claim↔source cosine ≥ this = grounded
     CITATION_VERIFY_THRESHOLD: float = 0.45  # citation sentence↔doc cosine ≥ this = verified
-    JUDGE_SAMPLES: int = 2                   # self-consistency samples for rubric judge
+    JUDGE_SAMPLES: int = 1                   # self-consistency samples for rubric judge
 
     # ── NEW: Retrieval v2 (RRF / MMR / CRAG / HyDE) ───────────────────────
     MMR_LAMBDA: float = 0.70                 # relevance vs diversity balance
