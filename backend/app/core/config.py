@@ -29,12 +29,12 @@ class Settings(BaseSettings):
     LLM_BACKEND: str = "gemini"
     LLM_MODEL: str = "gemini-3.6-flash"
     LLM_TEMPERATURE: float = 0.2
-    LLM_MAX_TOKENS: int = 1024
+    LLM_MAX_TOKENS: int = 1800
 
     EMBED_MODEL: str = "sentence-transformers/all-MiniLM-L6-v2"
     EMBED_DIM: int = 384
 
-    ARXIV_MAX_RESULTS: int = 5
+    ARXIV_MAX_RESULTS: int = 7
     ARXIV_CATEGORIES: List[str] = ["cs.AI", "cs.LG", "cs.CL", "cs.IR"]
 
     MEMRL_ALPHA: float = 0.3
